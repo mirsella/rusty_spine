@@ -5,7 +5,7 @@ use super::{ColorSpace, CullDirection};
 #[allow(unused_imports)]
 use crate::{draw::SimpleDrawer, extension};
 
-/// Renderables generated from [`CombinedDrawer::draw`].
+/// Renderable mesh data produced by [`CombinedDrawer`].
 pub struct CombinedRenderable {
     /// A list of vertex attributes for a mesh.
     pub vertices: Vec<[f32; 2]>,
@@ -23,6 +23,42 @@ pub struct CombinedRenderable {
     /// The attachment's renderer object as a raw pointer. Usually represents the texture created
     /// from [`extension::set_create_texture_cb`].
     pub attachment_renderer_object: Option<*const c_void>,
+}
+
+impl Default for CombinedRenderable {
+    fn default() -> Self {
+        Self {
+            vertices: Vec::new(),
+            uvs: Vec::new(),
+            colors: Vec::new(),
+            dark_colors: Vec::new(),
+            indices: Vec::new(),
+            blend_mode: BlendMode::Normal,
+            attachment_renderer_object: None,
+        }
+    }
+}
+
+/// Reusable working memory for [`CombinedDrawer::draw_into`].
+#[derive(Default)]
+pub struct CombinedDrawerScratch {
+    world_vertices: Vec<f32>,
+    renderables: Vec<CombinedRenderable>,
+}
+
+fn reuse_batch(renderables: &mut Vec<CombinedRenderable>, index: usize) -> &mut CombinedRenderable {
+    if renderables.len() <= index {
+        renderables.push(CombinedRenderable::default());
+    }
+    let renderable = &mut renderables[index];
+    renderable.vertices.clear();
+    renderable.uvs.clear();
+    renderable.colors.clear();
+    renderable.dark_colors.clear();
+    renderable.indices.clear();
+    renderable.blend_mode = BlendMode::Normal;
+    renderable.attachment_renderer_object = None;
+    renderable
 }
 
 /// A combined drawer with a mesh combining optimization.
@@ -49,24 +85,42 @@ impl CombinedDrawer {
     ///
     /// # Panics
     ///
-    /// Panics if not using the default attachment loader with valid atlas regions.
+    /// Panics if not using the default attachment loader with valid atlas regions,
+    /// or if one attachment exceeds the 16-bit vertex limit after clipping.
     pub fn draw(
         &self,
         skeleton: &mut Skeleton,
-        mut clipper: Option<&mut SkeletonClipping>,
+        clipper: Option<&mut SkeletonClipping>,
     ) -> Vec<CombinedRenderable> {
-        let mut renderables = vec![];
-        let mut vertices = vec![];
-        let mut uvs = vec![];
-        let mut colors = vec![];
-        let mut dark_colors = vec![];
-        let mut indices = vec![];
-        let mut blend_mode = BlendMode::Normal;
-        let mut attachment_renderer_object = None;
-        let mut world_vertices = vec![];
-        world_vertices.resize(1000, 0.);
-        let mut vertex_base: u16 = 0;
-        let mut index_base: u16 = 0;
+        let mut scratch = CombinedDrawerScratch::default();
+        let count = self.draw_into(skeleton, clipper, &mut scratch).len();
+        scratch.renderables.truncate(count);
+        scratch.renderables
+    }
+
+    /// Draws into reusable storage and returns only batches with indexed geometry.
+    ///
+    /// Spare attribute buffers stay in `scratch` for subsequent draws. Renderer object pointers
+    /// in the returned slice remain valid only while their owning atlas is alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if not using the default attachment loader with valid atlas regions,
+    /// or if one attachment exceeds the 16-bit vertex limit after clipping.
+    pub fn draw_into<'a>(
+        &self,
+        skeleton: &mut Skeleton,
+        mut clipper: Option<&mut SkeletonClipping>,
+        scratch: &'a mut CombinedDrawerScratch,
+    ) -> &'a [CombinedRenderable] {
+        const MAX_VERTICES: usize = u16::MAX as usize + 1;
+        let CombinedDrawerScratch {
+            world_vertices,
+            renderables,
+        } = scratch;
+        let mut renderable_count = 0;
+        let mut renderable = reuse_batch(renderables, renderable_count);
+        let index_order = self.cull_direction.index_order();
         for slot_index in 0..skeleton.slots_count() {
             let Some(slot) = skeleton.draw_order_at_index(slot_index) else {
                 continue;
@@ -83,7 +137,10 @@ impl CombinedDrawer {
                     clipper.clip_start(&slot, &clipping_attachment);
                 }
                 continue;
-            } else if slot.attachment().and_then(|a| a.as_mesh()).is_none()
+            } else if slot
+                .attachment()
+                .and_then(|a| a.as_mesh())
+                .is_none_or(|mesh| mesh.triangles_count() == 0)
                 && slot.attachment().and_then(|a| a.as_region()).is_none()
             {
                 if let Some(clipper) = clipper.as_deref_mut() {
@@ -93,19 +150,21 @@ impl CombinedDrawer {
             }
 
             if let Some(mesh_attachment) = slot.attachment().and_then(|a| a.as_mesh()) {
+                world_vertices.resize(mesh_attachment.world_vertices_length() as usize, 0.);
                 unsafe {
                     mesh_attachment.compute_world_vertices(
                         &slot,
                         0,
                         mesh_attachment.world_vertices_length(),
-                        &mut world_vertices,
+                        &mut *world_vertices,
                         0,
                         2,
                     );
                 }
             } else if let Some(region_attachment) = slot.attachment().and_then(|a| a.as_region()) {
+                world_vertices.resize(8, 0.);
                 unsafe {
-                    region_attachment.compute_world_vertices(&slot, &mut world_vertices, 0, 2);
+                    region_attachment.compute_world_vertices(&slot, &mut *world_vertices, 0, 2);
                 }
             }
 
@@ -155,32 +214,31 @@ impl CombinedDrawer {
                     },
                 );
 
-            if slot_index == 0 {
-                blend_mode = next_blend_mode;
-                attachment_renderer_object = next_attachment_renderer_object;
-            }
-            if blend_mode != next_blend_mode
-                || attachment_renderer_object != next_attachment_renderer_object
+            assert!(
+                world_vertices.len() / 2 <= MAX_VERTICES,
+                "Spine attachment exceeds u16 vertex indices"
+            );
+            if renderable.blend_mode != next_blend_mode
+                || renderable.attachment_renderer_object != next_attachment_renderer_object
+                || renderable.vertices.len() + world_vertices.len() / 2 > MAX_VERTICES
             {
-                renderables.push(CombinedRenderable {
-                    vertices,
-                    uvs,
-                    indices,
-                    colors,
-                    dark_colors,
-                    blend_mode,
-                    attachment_renderer_object,
-                });
-                vertices = vec![];
-                uvs = vec![];
-                colors = vec![];
-                dark_colors = vec![];
-                indices = vec![];
-                vertex_base = 0;
-                index_base = 0;
+                renderable_count += usize::from(!renderable.indices.is_empty());
+                renderable = reuse_batch(renderables, renderable_count);
             }
-            blend_mode = next_blend_mode;
-            attachment_renderer_object = next_attachment_renderer_object;
+            renderable.blend_mode = next_blend_mode;
+            renderable.attachment_renderer_object = next_attachment_renderer_object;
+            let CombinedRenderable {
+                vertices,
+                uvs,
+                colors,
+                dark_colors,
+                indices,
+                ..
+            } = &mut *renderable;
+
+            let mut vertex_base = vertices.len();
+            let mut index_base = indices.len();
+            vertices.extend_from_slice(world_vertices.as_chunks::<2>().0);
 
             let (color, dark_color) = if let Some(mesh_attachment) =
                 slot.attachment().and_then(|a| a.as_mesh())
@@ -204,68 +262,17 @@ impl CombinedDrawer {
                     ColorSpace::Linear => dark_color.nonlinear_to_linear(),
                 };
 
-                uvs.resize(
-                    vertex_base as usize + mesh_attachment.world_vertices_length() as usize,
-                    [0., 0.],
-                );
-                for i in 0..mesh_attachment.world_vertices_length() {
-                    vertices.push([
-                        world_vertices[i as usize * 2],
-                        world_vertices[i as usize * 2 + 1],
-                    ]);
-
-                    colors.push([color.r, color.g, color.b, color.a]);
-                    dark_colors.push([dark_color.r, dark_color.g, dark_color.b, dark_color.a]);
-                }
-
-                // UVs need to be copied from the indices. I'm not entirely sure why, but it can lead to crashes otherwise.
-                macro_rules! copy_uvs {
-                    ($i:ident) => {
-                        let index = *mesh_attachment.triangles().offset($i);
-                        uvs[vertex_base as usize + index as usize] = [
-                            *mesh_attachment.c_ptr_mut().uvs.offset(index as isize * 2),
-                            *mesh_attachment
-                                .c_ptr_mut()
-                                .uvs
-                                .offset(index as isize * 2 + 1),
-                        ];
-                        let index = *mesh_attachment.triangles().offset($i + 1);
-                        uvs[vertex_base as usize + index as usize] = [
-                            *mesh_attachment.c_ptr_mut().uvs.offset(index as isize * 2),
-                            *mesh_attachment
-                                .c_ptr_mut()
-                                .uvs
-                                .offset(index as isize * 2 + 1),
-                        ];
-                        let index = *mesh_attachment.triangles().offset($i + 2);
-                        uvs[vertex_base as usize + index as usize] = [
-                            *mesh_attachment.c_ptr_mut().uvs.offset(index as isize * 2),
-                            *mesh_attachment
-                                .c_ptr_mut()
-                                .uvs
-                                .offset(index as isize * 2 + 1),
-                        ];
-                    };
-                }
-
-                if matches!(self.cull_direction, CullDirection::CounterClockwise) {
-                    for i in (0..mesh_attachment.triangles_count() as isize).step_by(3) {
-                        unsafe {
-                            indices.push(vertex_base + *mesh_attachment.triangles().offset(i + 2));
-                            indices.push(vertex_base + *mesh_attachment.triangles().offset(i + 1));
-                            indices.push(vertex_base + *mesh_attachment.triangles().offset(i));
-                            copy_uvs!(i);
-                        }
-                    }
-                } else {
-                    for i in (0..mesh_attachment.triangles_count() as isize).step_by(3) {
-                        unsafe {
-                            indices.push(vertex_base + *mesh_attachment.triangles().offset(i));
-                            indices.push(vertex_base + *mesh_attachment.triangles().offset(i + 1));
-                            indices.push(vertex_base + *mesh_attachment.triangles().offset(i + 2));
-                            copy_uvs!(i);
-                        }
-                    }
+                uvs.extend((0..world_vertices.len() / 2).map(|i| unsafe {
+                    [
+                        *mesh_attachment.uvs().add(i * 2),
+                        *mesh_attachment.uvs().add(i * 2 + 1),
+                    ]
+                }));
+                for i in (0..mesh_attachment.triangles_count() as usize).step_by(3) {
+                    indices.extend(
+                        index_order
+                            .map(|offset| unsafe { *mesh_attachment.triangles().add(i + offset) }),
+                    );
                 }
 
                 (color, dark_color)
@@ -290,34 +297,14 @@ impl CombinedDrawer {
                 };
 
                 for i in 0..4 {
-                    vertices.push([
-                        world_vertices[i as usize * 2],
-                        world_vertices[i as usize * 2 + 1],
-                    ]);
-
                     uvs.push([
                         region_attachment.uvs()[i as usize * 2],
                         region_attachment.uvs()[i as usize * 2 + 1],
                     ]);
-
-                    colors.push([color.r, color.g, color.b, color.a]);
-                    dark_colors.push([dark_color.r, dark_color.g, dark_color.b, dark_color.a]);
                 }
 
-                if matches!(self.cull_direction, CullDirection::CounterClockwise) {
-                    indices.push(vertex_base + 2);
-                    indices.push(vertex_base + 1);
-                    indices.push(vertex_base);
-                    indices.push(vertex_base);
-                    indices.push(vertex_base + 3);
-                    indices.push(vertex_base + 2);
-                } else {
-                    indices.push(vertex_base);
-                    indices.push(vertex_base + 1);
-                    indices.push(vertex_base + 2);
-                    indices.push(vertex_base + 2);
-                    indices.push(vertex_base + 3);
-                    indices.push(vertex_base);
+                for triangle in [[0, 1, 2], [2, 3, 0]] {
+                    indices.extend(index_order.map(|i| triangle[i]));
                 }
 
                 (color, dark_color)
@@ -325,16 +312,19 @@ impl CombinedDrawer {
                 unreachable!();
             };
 
+            colors.resize(vertices.len(), [color.r, color.g, color.b, color.a]);
+            dark_colors.resize(
+                vertices.len(),
+                [dark_color.r, dark_color.g, dark_color.b, dark_color.a],
+            );
+
             if let Some(clipper) = clipper.as_deref_mut() {
                 if clipper.is_clipping() {
-                    for i in index_base..indices.len() as u16 {
-                        indices[i as usize] -= vertex_base;
-                    }
                     unsafe {
                         clipper.clip_triangles(
-                            &mut vertices.as_mut_slice()[(vertex_base as usize)..],
-                            &mut indices.as_mut_slice()[(index_base as usize)..],
-                            &mut uvs.as_mut_slice()[(vertex_base as usize)..],
+                            &mut vertices.as_mut_slice()[vertex_base..],
+                            &mut indices.as_mut_slice()[index_base..],
+                            &mut uvs.as_mut_slice()[vertex_base..],
                             2,
                         );
                         let clipped_triangles_size =
@@ -343,65 +333,80 @@ impl CombinedDrawer {
                             (*clipper.c_ptr_ref().clippedVertices).size as usize;
                         let clipped_uvs_size = (*clipper.c_ptr_ref().clippedUVs).size as usize;
                         colors.resize(
-                            vertex_base as usize + (clipped_vertices_size / 2),
+                            vertex_base + (clipped_vertices_size / 2),
                             [color.r, color.g, color.b, color.a],
                         );
                         dark_colors.resize(
-                            vertex_base as usize + (clipped_vertices_size / 2),
+                            vertex_base + (clipped_vertices_size / 2),
                             [dark_color.r, dark_color.g, dark_color.b, dark_color.a],
                         );
-                        indices.resize(index_base as usize + clipped_triangles_size, 0);
+                        indices.resize(index_base + clipped_triangles_size, 0);
                         std::ptr::copy_nonoverlapping(
                             (*clipper.c_ptr_ref().clippedTriangles).items,
-                            indices.as_mut_ptr().offset(index_base as isize),
+                            indices.as_mut_ptr().add(index_base),
                             clipped_triangles_size,
                         );
-                        vertices.resize(vertex_base as usize + clipped_vertices_size / 2, [0., 0.]);
+                        vertices.resize(vertex_base + clipped_vertices_size / 2, [0., 0.]);
                         std::ptr::copy_nonoverlapping(
                             (*clipper.c_ptr_ref().clippedVertices).items,
-                            vertices
-                                .as_mut_ptr()
-                                .offset(vertex_base as isize)
-                                .cast::<f32>(),
+                            vertices.as_mut_ptr().add(vertex_base).cast::<f32>(),
                             clipped_vertices_size,
                         );
-                        uvs.resize(vertex_base as usize + clipped_uvs_size / 2, [0., 0.]);
+                        uvs.resize(vertex_base + clipped_uvs_size / 2, [0., 0.]);
                         std::ptr::copy_nonoverlapping(
                             (*clipper.c_ptr_ref().clippedUVs).items,
-                            uvs.as_mut_ptr().offset(vertex_base as isize).cast::<f32>(),
+                            uvs.as_mut_ptr().add(vertex_base).cast::<f32>(),
                             clipped_uvs_size,
                         );
-                    }
-                    for i in index_base..indices.len() as u16 {
-                        indices[i as usize] += vertex_base;
                     }
                 }
             }
 
-            vertex_base = vertices.len() as u16;
-            index_base = indices.len() as u16;
+            // Clipping can add vertices. Move just this attachment to a fresh batch
+            // before rebasing its still-local indices; preserve the preceding geometry.
+            if renderable.vertices.len() > MAX_VERTICES {
+                assert!(
+                    renderable.vertices.len() - vertex_base <= MAX_VERTICES,
+                    "clipped Spine attachment exceeds u16 vertex indices"
+                );
+                renderable_count += 1;
+                reuse_batch(renderables, renderable_count);
+                let (previous, next) = renderables.split_at_mut(renderable_count);
+                let previous = &mut previous[renderable_count - 1];
+                renderable = &mut next[0];
+                renderable.blend_mode = previous.blend_mode;
+                renderable.attachment_renderer_object = previous.attachment_renderer_object;
+                renderable
+                    .vertices
+                    .extend(previous.vertices.drain(vertex_base..));
+                renderable.uvs.extend(previous.uvs.drain(vertex_base..));
+                renderable
+                    .colors
+                    .extend(previous.colors.drain(vertex_base..));
+                renderable
+                    .dark_colors
+                    .extend(previous.dark_colors.drain(vertex_base..));
+                renderable
+                    .indices
+                    .extend(previous.indices.drain(index_base..));
+                vertex_base = 0;
+                index_base = 0;
+            }
+            for index in &mut renderable.indices[index_base..] {
+                *index += vertex_base as u16;
+            }
 
             if let Some(clipper) = clipper.as_deref_mut() {
                 clipper.clip_end(&slot);
             }
         }
 
-        if !indices.is_empty() {
-            renderables.push(CombinedRenderable {
-                vertices,
-                uvs,
-                indices,
-                colors,
-                dark_colors,
-                blend_mode,
-                attachment_renderer_object,
-            });
-        }
+        renderable_count += usize::from(!renderable.indices.is_empty());
 
         if let Some(clipper) = clipper {
             clipper.clip_end2();
         }
-        renderables
+        &renderables[..renderable_count]
     }
 }
 
@@ -425,6 +430,82 @@ mod test {
                 let mut clipper = SkeletonClipping::new();
                 let renderables = drawer.draw(&mut skeleton, Some(&mut clipper));
                 assert!(!renderables.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_combined_draw_matches_fresh_output_and_retains_capacity() {
+        for json in [true, false] {
+            for example_asset in TestAsset::all() {
+                let (skeleton_data, _) = example_asset.instance_data(json);
+                let mut expected_skeleton = Skeleton::new(skeleton_data.clone());
+                let mut actual_skeleton = Skeleton::new(skeleton_data);
+                let drawer = CombinedDrawer {
+                    cull_direction: CullDirection::Clockwise,
+                    premultiplied_alpha: false,
+                    color_space: ColorSpace::Linear,
+                };
+                let mut expected_clipper = SkeletonClipping::new();
+                let mut actual_clipper = SkeletonClipping::new();
+                let mut scratch = CombinedDrawerScratch::default();
+                let slots = actual_skeleton
+                    .slots()
+                    .map(|slot| slot.data().name().to_owned())
+                    .collect::<Vec<_>>();
+                let mut capacities = None;
+                for hidden in [false, true, false, false] {
+                    for skeleton in [&mut expected_skeleton, &mut actual_skeleton] {
+                        if hidden {
+                            for slot in &slots {
+                                assert!(skeleton.set_attachment(slot, None));
+                            }
+                        } else {
+                            skeleton.set_slots_to_setup_pose();
+                        }
+                    }
+                    let expected = drawer.draw(&mut expected_skeleton, Some(&mut expected_clipper));
+                    let actual = drawer.draw_into(
+                        &mut actual_skeleton,
+                        Some(&mut actual_clipper),
+                        &mut scratch,
+                    );
+                    assert_eq!(actual.is_empty(), hidden);
+                    assert_eq!(actual.len(), expected.len());
+                    for (expected, actual) in expected.iter().zip(actual) {
+                        assert_eq!(expected.vertices, actual.vertices);
+                        assert_eq!(expected.uvs, actual.uvs);
+                        assert_eq!(expected.colors, actual.colors);
+                        assert_eq!(expected.dark_colors, actual.dark_colors);
+                        assert_eq!(expected.indices, actual.indices);
+                        assert_eq!(expected.blend_mode, actual.blend_mode);
+                        assert_eq!(
+                            expected.attachment_renderer_object,
+                            actual.attachment_renderer_object
+                        );
+                    }
+                    let current_capacities = (
+                        scratch.renderables.capacity(),
+                        scratch.world_vertices.capacity(),
+                        scratch
+                            .renderables
+                            .iter()
+                            .map(|renderable| {
+                                (
+                                    renderable.vertices.capacity(),
+                                    renderable.uvs.capacity(),
+                                    renderable.colors.capacity(),
+                                    renderable.dark_colors.capacity(),
+                                    renderable.indices.capacity(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    if let Some(previous) = &capacities {
+                        assert_eq!(&current_capacities, previous);
+                    }
+                    capacities = Some(current_capacities);
+                }
             }
         }
     }

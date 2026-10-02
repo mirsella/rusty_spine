@@ -1,14 +1,11 @@
-use crate::{
-    c::{c_void, spMeshAttachment_updateRegion},
-    BlendMode, Color, Skeleton, SkeletonClipping,
-};
+use crate::{c::c_void, BlendMode, Color, Skeleton, SkeletonClipping};
 
 use super::{ColorSpace, CullDirection};
 
 #[allow(unused_imports)]
 use crate::extension;
 
-/// Renderables generated from [`SimpleDrawer::draw`].
+/// Renderable mesh data produced by [`SimpleDrawer`].
 #[derive(Clone)]
 pub struct SimpleRenderable {
     /// The index of the slot in [`Skeleton`] that this renderable represents.
@@ -29,6 +26,28 @@ pub struct SimpleRenderable {
     /// The attachment's renderer object as a raw pointer. Usually represents the texture created
     /// from [`extension::set_create_texture_cb`].
     pub attachment_renderer_object: Option<*const c_void>,
+}
+
+impl Default for SimpleRenderable {
+    fn default() -> Self {
+        Self {
+            slot_index: 0,
+            vertices: Vec::new(),
+            uvs: Vec::new(),
+            indices: Vec::new(),
+            color: Color::default(),
+            dark_color: Color::default(),
+            blend_mode: BlendMode::Normal,
+            attachment_renderer_object: None,
+        }
+    }
+}
+
+/// Reusable working memory for [`SimpleDrawer::draw_into`].
+#[derive(Default)]
+pub struct SimpleDrawerScratch {
+    world_vertices: Vec<f32>,
+    renderables: Vec<SimpleRenderable>,
 }
 
 /// A simple drawer with no optimizations.
@@ -58,11 +77,34 @@ impl SimpleDrawer {
     pub fn draw(
         &self,
         skeleton: &mut Skeleton,
-        mut clipper: Option<&mut SkeletonClipping>,
+        clipper: Option<&mut SkeletonClipping>,
     ) -> Vec<SimpleRenderable> {
-        let mut renderables = vec![];
-        let mut world_vertices = vec![];
-        world_vertices.resize(1000, 0.);
+        let mut scratch = SimpleDrawerScratch::default();
+        let count = self.draw_into(skeleton, clipper, &mut scratch).len();
+        scratch.renderables.truncate(count);
+        scratch.renderables
+    }
+
+    /// Draws into reusable storage and returns only the current renderables.
+    ///
+    /// Spare attribute buffers stay in `scratch` for subsequent draws. Renderer object pointers
+    /// in the returned slice remain valid only while their owning atlas is alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if not using the default attachment loader with valid atlas regions.
+    pub fn draw_into<'a>(
+        &self,
+        skeleton: &mut Skeleton,
+        mut clipper: Option<&mut SkeletonClipping>,
+        scratch: &'a mut SimpleDrawerScratch,
+    ) -> &'a [SimpleRenderable] {
+        let SimpleDrawerScratch {
+            world_vertices,
+            renderables,
+        } = scratch;
+        let index_order = self.cull_direction.index_order();
+        let mut renderable_count = 0;
         for slot_index in 0..skeleton.slots_count() {
             let Some(slot) = skeleton.draw_order_at_index(slot_index) else {
                 continue;
@@ -74,95 +116,59 @@ impl SimpleDrawer {
                 continue;
             }
 
-            let mut vertices = vec![];
-            let mut indices = vec![];
-            let mut uvs = vec![];
+            if renderables.len() <= renderable_count {
+                renderables.push(SimpleRenderable::default());
+            }
+            let renderable = &mut renderables[renderable_count];
+            let vertices = &mut renderable.vertices;
+            let indices = &mut renderable.indices;
+            let uvs = &mut renderable.uvs;
+            vertices.clear();
+            indices.clear();
+            uvs.clear();
+
             let mut color;
 
-            if let Some(mesh_attachment) = slot.attachment().and_then(|a| a.as_mesh()) {
-                unsafe {
-                    spMeshAttachment_updateRegion(mesh_attachment.c_ptr());
-                };
+            if let Some(mut mesh_attachment) = slot.attachment().and_then(|a| a.as_mesh()) {
+                mesh_attachment.update_region();
                 color = mesh_attachment.color();
+
+                // Spine counts XY coordinates, not vertices. Size the native output before writing.
+                world_vertices.resize(mesh_attachment.world_vertices_length() as usize, 0.);
 
                 unsafe {
                     mesh_attachment.compute_world_vertices(
                         &slot,
                         0,
                         mesh_attachment.world_vertices_length(),
-                        &mut world_vertices,
+                        &mut *world_vertices,
                         0,
                         2,
                     );
                 }
 
-                vertices.reserve(mesh_attachment.world_vertices_length() as usize);
-                uvs.reserve(mesh_attachment.world_vertices_length() as usize);
-                uvs.resize(mesh_attachment.world_vertices_length() as usize, [0., 0.]);
-                for i in 0..mesh_attachment.world_vertices_length() {
-                    vertices.push([
-                        world_vertices[i as usize * 2],
-                        world_vertices[i as usize * 2 + 1],
-                    ]);
-                }
-
-                // UVs need to be copied from the indices. I'm not entirely sure why, but it can lead to crashes otherwise.
-                macro_rules! copy_uvs {
-                    ($i:ident) => {
-                        let index = *mesh_attachment.triangles().offset($i);
-                        uvs[index as usize] = [
-                            *mesh_attachment.c_ptr_mut().uvs.offset(index as isize * 2),
-                            *mesh_attachment
-                                .c_ptr_mut()
-                                .uvs
-                                .offset(index as isize * 2 + 1),
-                        ];
-                        let index = *mesh_attachment.triangles().offset($i + 1);
-                        uvs[index as usize] = [
-                            *mesh_attachment.c_ptr_mut().uvs.offset(index as isize * 2),
-                            *mesh_attachment
-                                .c_ptr_mut()
-                                .uvs
-                                .offset(index as isize * 2 + 1),
-                        ];
-                        let index = *mesh_attachment.triangles().offset($i + 2);
-                        uvs[index as usize] = [
-                            *mesh_attachment.c_ptr_mut().uvs.offset(index as isize * 2),
-                            *mesh_attachment
-                                .c_ptr_mut()
-                                .uvs
-                                .offset(index as isize * 2 + 1),
-                        ];
-                    };
-                }
+                let vertex_count = world_vertices.len() / 2;
+                vertices.extend_from_slice(world_vertices.as_chunks::<2>().0);
+                uvs.extend((0..vertex_count).map(|i| unsafe {
+                    [
+                        *mesh_attachment.uvs().add(i * 2),
+                        *mesh_attachment.uvs().add(i * 2 + 1),
+                    ]
+                }));
 
                 indices.reserve(mesh_attachment.triangles_count() as usize);
-                if matches!(self.cull_direction, CullDirection::CounterClockwise) {
-                    for i in (0..mesh_attachment.triangles_count() as isize).step_by(3) {
-                        unsafe {
-                            indices.push(*mesh_attachment.triangles().offset(i + 2));
-                            indices.push(*mesh_attachment.triangles().offset(i + 1));
-                            indices.push(*mesh_attachment.triangles().offset(i));
-                            copy_uvs!(i);
-                        }
-                    }
-                } else {
-                    for i in (0..mesh_attachment.triangles_count() as isize).step_by(3) {
-                        unsafe {
-                            indices.push(*mesh_attachment.triangles().offset(i));
-                            indices.push(*mesh_attachment.triangles().offset(i + 1));
-                            indices.push(*mesh_attachment.triangles().offset(i + 2));
-                            copy_uvs!(i);
-                        }
-                    }
+                for i in (0..mesh_attachment.triangles_count() as usize).step_by(3) {
+                    indices.extend(
+                        index_order
+                            .map(|offset| unsafe { *mesh_attachment.triangles().add(i + offset) }),
+                    );
                 }
             } else if let Some(region_attachment) = slot.attachment().and_then(|a| a.as_region()) {
                 color = region_attachment.color();
 
-                let mut world_vertices = vec![];
-                world_vertices.resize(1000, 0.);
+                world_vertices.resize(8, 0.);
                 unsafe {
-                    region_attachment.compute_world_vertices(&slot, &mut world_vertices, 0, 2);
+                    region_attachment.compute_world_vertices(&slot, &mut *world_vertices, 0, 2);
                 }
 
                 vertices.reserve(4);
@@ -180,20 +186,8 @@ impl SimpleDrawer {
                 }
 
                 indices.reserve(6);
-                if matches!(self.cull_direction, CullDirection::CounterClockwise) {
-                    indices.push(2);
-                    indices.push(1);
-                    indices.push(0);
-                    indices.push(0);
-                    indices.push(3);
-                    indices.push(2);
-                } else {
-                    indices.push(0);
-                    indices.push(1);
-                    indices.push(2);
-                    indices.push(2);
-                    indices.push(3);
-                    indices.push(0);
+                for triangle in [[0, 1, 2], [2, 3, 0]] {
+                    indices.extend(index_order.map(|i| triangle[i]));
                 }
             } else if let Some(clipping_attachment) =
                 slot.attachment().and_then(|a| a.as_clipping())
@@ -302,16 +296,12 @@ impl SimpleDrawer {
                 ColorSpace::Linear => dark_color.nonlinear_to_linear(),
             };
 
-            renderables.push(SimpleRenderable {
-                slot_index,
-                vertices,
-                uvs,
-                indices,
-                color,
-                dark_color,
-                blend_mode: slot.data().blend_mode(),
-                attachment_renderer_object,
-            });
+            renderable.slot_index = slot_index;
+            renderable.color = color;
+            renderable.dark_color = dark_color;
+            renderable.blend_mode = slot.data().blend_mode();
+            renderable.attachment_renderer_object = attachment_renderer_object;
+            renderable_count += 1;
             if let Some(clipper) = clipper.as_deref_mut() {
                 clipper.clip_end(&slot);
             }
@@ -320,7 +310,7 @@ impl SimpleDrawer {
         if let Some(clipper) = clipper {
             clipper.clip_end2();
         }
-        renderables
+        &renderables[..renderable_count]
     }
 }
 
@@ -344,6 +334,81 @@ mod test {
                 let mut clipper = SkeletonClipping::new();
                 let renderables = drawer.draw(&mut skeleton, Some(&mut clipper));
                 assert!(!renderables.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_simple_draw_matches_fresh_output_and_retains_capacity() {
+        for json in [true, false] {
+            for example_asset in TestAsset::all() {
+                let (skeleton_data, _) = example_asset.instance_data(json);
+                let mut expected_skeleton = Skeleton::new(skeleton_data.clone());
+                let mut actual_skeleton = Skeleton::new(skeleton_data);
+                let drawer = SimpleDrawer {
+                    cull_direction: CullDirection::Clockwise,
+                    premultiplied_alpha: false,
+                    color_space: ColorSpace::Linear,
+                };
+                let mut expected_clipper = SkeletonClipping::new();
+                let mut actual_clipper = SkeletonClipping::new();
+                let mut scratch = SimpleDrawerScratch::default();
+                let slots = actual_skeleton
+                    .slots()
+                    .map(|slot| slot.data().name().to_owned())
+                    .collect::<Vec<_>>();
+                let mut capacities = None;
+                for hidden in [false, true, false, false] {
+                    for skeleton in [&mut expected_skeleton, &mut actual_skeleton] {
+                        if hidden {
+                            for slot in &slots {
+                                assert!(skeleton.set_attachment(slot, None));
+                            }
+                        } else {
+                            skeleton.set_slots_to_setup_pose();
+                        }
+                    }
+                    let expected = drawer.draw(&mut expected_skeleton, Some(&mut expected_clipper));
+                    let actual = drawer.draw_into(
+                        &mut actual_skeleton,
+                        Some(&mut actual_clipper),
+                        &mut scratch,
+                    );
+                    assert_eq!(actual.is_empty(), hidden);
+                    assert_eq!(actual.len(), expected.len());
+                    for (expected, actual) in expected.iter().zip(actual) {
+                        assert_eq!(expected.slot_index, actual.slot_index);
+                        assert_eq!(expected.vertices, actual.vertices);
+                        assert_eq!(expected.uvs, actual.uvs);
+                        assert_eq!(expected.indices, actual.indices);
+                        assert_eq!(expected.color, actual.color);
+                        assert_eq!(expected.dark_color, actual.dark_color);
+                        assert_eq!(expected.blend_mode, actual.blend_mode);
+                        assert_eq!(
+                            expected.attachment_renderer_object,
+                            actual.attachment_renderer_object
+                        );
+                    }
+                    let current_capacities = (
+                        scratch.renderables.capacity(),
+                        scratch.world_vertices.capacity(),
+                        scratch
+                            .renderables
+                            .iter()
+                            .map(|renderable| {
+                                (
+                                    renderable.vertices.capacity(),
+                                    renderable.uvs.capacity(),
+                                    renderable.indices.capacity(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    if let Some(previous) = &capacities {
+                        assert_eq!(&current_capacities, previous);
+                    }
+                    capacities = Some(current_capacities);
+                }
             }
         }
     }
